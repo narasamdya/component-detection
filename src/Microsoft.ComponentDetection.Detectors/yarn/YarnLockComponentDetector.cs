@@ -1,12 +1,14 @@
 namespace Microsoft.ComponentDetection.Detectors.Yarn;
 
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using System.Runtime.InteropServices;
 using System.Threading;
 using System.Threading.Tasks;
+using System.Threading.Tasks.Dataflow;
 using global::DotNet.Globbing;
 using Microsoft.ComponentDetection.Contracts;
 using Microsoft.ComponentDetection.Contracts.Internal;
@@ -62,7 +64,7 @@ public class YarnLockComponentDetector : FileComponentDetector
         {
             var parsed = await this.yarnLockFileFactory.ParseYarnLockFileAsync(singleFileComponentRecorder, file.Stream, this.Logger);
             this.RecordLockfileVersion(parsed.LockfileVersion);
-            this.DetectComponents(parsed, file.Location, singleFileComponentRecorder);
+            await this.DetectComponentsAsync(parsed, file.Location, singleFileComponentRecorder);
         }
         catch (Exception ex)
         {
@@ -70,7 +72,7 @@ public class YarnLockComponentDetector : FileComponentDetector
         }
     }
 
-    private void DetectComponents(YarnLockFile file, string location, ISingleFileComponentRecorder singleFileComponentRecorder)
+    private async Task DetectComponentsAsync(YarnLockFile file, string location, ISingleFileComponentRecorder singleFileComponentRecorder)
     {
         var yarnPackages = new Dictionary<string, YarnEntry>();
 
@@ -92,7 +94,8 @@ public class YarnLockComponentDetector : FileComponentDetector
             }
         }
 
-        if (yarnPackages.Count == 0 || !this.TryReadPeerPackageJsonRequestsAsYarnEntries(singleFileComponentRecorder, location, yarnPackages, out var yarnRoots))
+        var yarnRoots = new List<YarnEntry>();
+        if (yarnPackages.Count == 0 || !await this.TryReadPeerPackageJsonRequestsAsYarnEntriesAsync(singleFileComponentRecorder, location, yarnPackages, yarnRoots))
         {
             return;
         }
@@ -192,10 +195,8 @@ public class YarnLockComponentDetector : FileComponentDetector
     /// <param name="yarnEntries">All the yarn entries that we know about.</param>
     /// <param name="yarnRoots">The output yarnRoots that we care about using as starting points.</param>
     /// <returns>False if no package.json file was found at location, otherwise it returns true. </returns>
-    private bool TryReadPeerPackageJsonRequestsAsYarnEntries(ISingleFileComponentRecorder singleFileComponentRecorder, string location, Dictionary<string, YarnEntry> yarnEntries, out List<YarnEntry> yarnRoots)
+    private async Task<bool> TryReadPeerPackageJsonRequestsAsYarnEntriesAsync(ISingleFileComponentRecorder singleFileComponentRecorder, string location, Dictionary<string, YarnEntry> yarnEntries, List<YarnEntry> yarnRoots)
     {
-        yarnRoots = [];
-
         var pkgJsons = this.ComponentStreamEnumerableFactory.GetComponentStreams(new FileInfo(location).Directory, ["package.json"], (name, directoryName) => false, recursivelyScanDirectories: false);
 
         IDictionary<string, IDictionary<string, bool>> combinedDependencies = new Dictionary<string, IDictionary<string, bool>>();
@@ -215,15 +216,42 @@ public class YarnLockComponentDetector : FileComponentDetector
             return false;
         }
 
-        var workspaceDependencyVsLocationMap = new Dictionary<string, string>();
+        var combinedDependenciesForProcessing = new ConcurrentDictionary<string, ConcurrentDictionary<string, bool>>();
+        foreach (var dependency in combinedDependencies)
+        {
+            combinedDependenciesForProcessing.TryAdd(dependency.Key, new ConcurrentDictionary<string, bool>(dependency.Value));
+        }
+
+        var workspaceDependencyVsLocationMap = new ConcurrentDictionary<string, string>();
+
         if (yarnWorkspaces.Count > 0)
         {
-            this.GetWorkspaceDependencies(yarnWorkspaces, new FileInfo(location).Directory, combinedDependencies, workspaceDependencyVsLocationMap);
+            var processingBlock = new ActionBlock<(IComponentStream Stream, string WorkspacePattern)>(
+                processingEntry =>
+                {
+                    var stream = processingEntry.Stream;
+                    var workspacePattern = processingEntry.WorkspacePattern;
+                    this.Logger.LogInformation("{ComponentLocation} found for workspace {WorkspacePattern}", stream.Location, workspacePattern);
+                    var combinedDependencies = NpmComponentUtilities.TryGetAllPackageJsonDependencies(stream.Stream, out _);
+
+                    foreach (var dependency in combinedDependencies)
+                    {
+                        this.ProcessWorkspaceDependency(combinedDependenciesForProcessing, dependency, workspaceDependencyVsLocationMap, stream.Location);
+                    }
+                },
+                new ExecutionDataflowBlockOptions()
+                {
+                    MaxDegreeOfParallelism = Environment.ProcessorCount * 2,
+                });
+
+            this.GetWorkspaceDependencies(processingBlock, yarnWorkspaces, new FileInfo(location).Directory, combinedDependenciesForProcessing, workspaceDependencyVsLocationMap);
+            processingBlock.Complete();
+            await processingBlock.Completion;
         }
 
         // Convert all of the dependencies we retrieved from package.json
         // into the appropriate yarn package
-        foreach (var dependency in combinedDependencies)
+        foreach (var dependency in combinedDependenciesForProcessing)
         {
             var name = dependency.Key;
             foreach (var version in dependency.Value)
@@ -243,9 +271,9 @@ public class YarnLockComponentDetector : FileComponentDetector
                 yarnRoots.Add(entry);
 
                 var locationMapDictonaryKey = this.GetLocationMapKey(name, version.Key);
-                if (workspaceDependencyVsLocationMap.ContainsKey(locationMapDictonaryKey))
+                if (workspaceDependencyVsLocationMap.TryGetValue(locationMapDictonaryKey, out var locationMapDictonaryValue))
                 {
-                    entry.Location = workspaceDependencyVsLocationMap[locationMapDictonaryKey];
+                    entry.Location = locationMapDictonaryValue;
                 }
             }
         }
@@ -253,7 +281,7 @@ public class YarnLockComponentDetector : FileComponentDetector
         return true;
     }
 
-    private void GetWorkspaceDependencies(IList<string> yarnWorkspaces, DirectoryInfo root, IDictionary<string, IDictionary<string, bool>> dependencies, IDictionary<string, string> workspaceDependencyVsLocationMap)
+    private void GetWorkspaceDependencies(ActionBlock<(IComponentStream Stream, string WorkspacePattern)> processingBlock, IList<string> yarnWorkspaces, DirectoryInfo root, ConcurrentDictionary<string, ConcurrentDictionary<string, bool>> dependencies, ConcurrentDictionary<string, string> workspaceDependencyVsLocationMap)
     {
         var ignoreCase = RuntimeInformation.IsOSPlatform(OSPlatform.Windows);
 
@@ -273,47 +301,46 @@ public class YarnLockComponentDetector : FileComponentDetector
 
             foreach (var stream in componentStreams)
             {
-                this.Logger.LogInformation("{ComponentLocation} found for workspace {WorkspacePattern}", stream.Location, workspacePattern);
-                var combinedDependencies = NpmComponentUtilities.TryGetAllPackageJsonDependencies(stream.Stream, out _);
-
-                foreach (var dependency in combinedDependencies)
-                {
-                    this.ProcessWorkspaceDependency(dependencies, dependency, workspaceDependencyVsLocationMap, stream.Location);
-                }
+                processingBlock.Post((stream, workspacePattern));
             }
         }
     }
 
-    private void ProcessWorkspaceDependency(IDictionary<string, IDictionary<string, bool>> dependencies, KeyValuePair<string, IDictionary<string, bool>> newDependency, IDictionary<string, string> workspaceDependencyVsLocationMap, string streamLocation)
+    private void ProcessWorkspaceDependency(ConcurrentDictionary<string, ConcurrentDictionary<string, bool>> dependencies, KeyValuePair<string, IDictionary<string, bool>> newDependency, ConcurrentDictionary<string, string> workspaceDependencyVsLocationMap, string streamLocation)
     {
         try
         {
-            if (!dependencies.TryGetValue(newDependency.Key, out var existingDependency))
-            {
-                dependencies.Add(newDependency.Key, newDependency.Value);
-                foreach (var item in newDependency.Value)
+            dependencies.AddOrUpdate(
+                newDependency.Key,
+                (key) =>
                 {
-                    // Adding 'Package.json stream's location'(in which workspacedependency of Yarn.lock file was found) as location of respective WorkSpaceDependency.
-                    this.AddLocationInfoToWorkspaceDependency(workspaceDependencyVsLocationMap, streamLocation, newDependency.Key, item.Key);
-                }
+                    foreach (var item in newDependency.Value)
+                    {
+                        // Adding 'Package.json stream's location'(in which workspacedependency of Yarn.lock file was found) as location of respective WorkSpaceDependency.
+                        this.AddLocationInfoToWorkspaceDependency(workspaceDependencyVsLocationMap, streamLocation, newDependency.Key, item.Key);
+                    }
 
-                return;
-            }
-
-            foreach (var item in newDependency.Value)
-            {
-                if (existingDependency.TryGetValue(item.Key, out var wasDev))
+                    return new ConcurrentDictionary<string, bool>(newDependency.Value);
+                },
+                (key, existingDependency) =>
                 {
-                    existingDependency[item.Key] = wasDev && item.Value;
-                }
-                else
-                {
-                    existingDependency[item.Key] = item.Value;
-                }
+                    foreach (var item in newDependency.Value)
+                    {
+                        if (existingDependency.TryGetValue(item.Key, out var wasDev))
+                        {
+                            existingDependency[item.Key] = wasDev && item.Value;
+                        }
+                        else
+                        {
+                            existingDependency[item.Key] = item.Value;
+                        }
 
-                // Adding 'Package.json stream's location'(in which workspacedependency of Yarn.lock file was found) as location of respective WorkSpaceDependency.
-                this.AddLocationInfoToWorkspaceDependency(workspaceDependencyVsLocationMap, streamLocation, newDependency.Key, item.Key);
-            }
+                        // Adding 'Package.json stream's location'(in which workspacedependency of Yarn.lock file was found) as location of respective WorkSpaceDependency.
+                        this.AddLocationInfoToWorkspaceDependency(workspaceDependencyVsLocationMap, streamLocation, newDependency.Key, item.Key);
+                    }
+
+                    return existingDependency;
+                });
         }
         catch (Exception ex)
         {
@@ -321,13 +348,10 @@ public class YarnLockComponentDetector : FileComponentDetector
         }
     }
 
-    private void AddLocationInfoToWorkspaceDependency(IDictionary<string, string> workspaceDependencyVsLocationMap, string streamLocation, string dependencyName, string dependencyVersion)
+    private void AddLocationInfoToWorkspaceDependency(ConcurrentDictionary<string, string> workspaceDependencyVsLocationMap, string streamLocation, string dependencyName, string dependencyVersion)
     {
         var locationMapDictionaryKey = this.GetLocationMapKey(dependencyName, dependencyVersion);
-        if (!workspaceDependencyVsLocationMap.ContainsKey(locationMapDictionaryKey))
-        {
-            workspaceDependencyVsLocationMap[locationMapDictionaryKey] = streamLocation;
-        }
+        workspaceDependencyVsLocationMap.TryAdd(locationMapDictionaryKey, streamLocation);
     }
 
     private string GetLocationMapKey(string dependencyName, string dependencyVersion)
