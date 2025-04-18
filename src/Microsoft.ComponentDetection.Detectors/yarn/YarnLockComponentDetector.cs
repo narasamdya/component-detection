@@ -10,6 +10,7 @@ using System.Threading;
 using System.Threading.Tasks;
 using System.Threading.Tasks.Dataflow;
 using global::DotNet.Globbing;
+using Microsoft.ComponentDetection.Common;
 using Microsoft.ComponentDetection.Contracts;
 using Microsoft.ComponentDetection.Contracts.Internal;
 using Microsoft.ComponentDetection.Contracts.TypedComponent;
@@ -238,11 +239,12 @@ public class YarnLockComponentDetector : FileComponentDetector
                     {
                         this.ProcessWorkspaceDependency(combinedDependenciesForProcessing, dependency, workspaceDependencyVsLocationMap, stream.Location);
                     }
+
+                    stream.Stream.Dispose();
                 },
                 new ExecutionDataflowBlockOptions()
                 {
-                    MaxDegreeOfParallelism = 1, // Environment.ProcessorCount * 2,
-                    EnsureOrdered = true,
+                    MaxDegreeOfParallelism = Environment.ProcessorCount * 2,
                 });
 
             this.GetWorkspaceDependencies(processingBlock, yarnWorkspaces, new FileInfo(location).Directory, combinedDependenciesForProcessing, workspaceDependencyVsLocationMap);
@@ -302,7 +304,20 @@ public class YarnLockComponentDetector : FileComponentDetector
 
             foreach (var stream in componentStreams)
             {
-                processingBlock.Post((stream, workspacePattern));
+                // Create a copy of the stream to prevent it from being closed prematurely
+                var streamCopy = new MemoryStream();
+                stream.Stream.CopyTo(streamCopy);
+                streamCopy.Position = 0;
+
+                // Create a new component stream with the copied stream
+                var componentStreamCopy = new ComponentStream
+                {
+                    Location = stream.Location,
+                    Pattern = stream.Pattern,
+                    Stream = streamCopy,
+                };
+
+                processingBlock.Post((componentStreamCopy, workspacePattern));
             }
         }
     }
