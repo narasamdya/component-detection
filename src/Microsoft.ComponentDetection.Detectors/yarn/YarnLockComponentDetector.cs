@@ -241,7 +241,7 @@ public class YarnLockComponentDetector : FileComponentDetector
                 },
                 new ExecutionDataflowBlockOptions()
                 {
-                    MaxDegreeOfParallelism = Environment.ProcessorCount * 2,
+                    MaxDegreeOfParallelism = 1, // Environment.ProcessorCount * 2,
                     EnsureOrdered = true,
                 });
 
