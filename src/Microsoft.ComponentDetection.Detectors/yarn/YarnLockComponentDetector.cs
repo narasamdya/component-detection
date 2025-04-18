@@ -242,6 +242,7 @@ public class YarnLockComponentDetector : FileComponentDetector
                 new ExecutionDataflowBlockOptions()
                 {
                     MaxDegreeOfParallelism = Environment.ProcessorCount * 2,
+                    EnsureOrdered = true,
                 });
 
             this.GetWorkspaceDependencies(processingBlock, yarnWorkspaces, new FileInfo(location).Directory, combinedDependenciesForProcessing, workspaceDependencyVsLocationMap);
